@@ -8,9 +8,9 @@ from langgraph.store.base import BaseStore
 from pydantic import BaseModel, Field
 
 from llm_setup import llm
-from prompt import MEMORY_PROMPT, SYSTEM_PROMPT_TEMPLATE, REFINE_PROMPT
+from prompt import MEMORY_PROMPT, SYSTEM_PROMPT_TEMPLATE
 from tools import (
-    get_time_by_location,
+    get_current_date_and_time,
     web_search,
     calculator,
     safe_shell_executor,
@@ -20,7 +20,7 @@ from tools import (
 
 # ── Tools ────────────────────────────────────────────────────────
 tools_list = [
-    get_time_by_location,
+    get_current_date_and_time,
     web_search,
     calculator,
     safe_shell_executor,
@@ -83,13 +83,13 @@ def remember_node(
     return {}
 
 
-# ── Node 2: Chat (raw response with personality) ────────────────
+# ── Node 2: Chat (raw response + tool calls) ────────────────────
 def chat_node(
     state: MessagesState,
     config: RunnableConfig,
     store: BaseStore,
 ):
-    """Generate a raw response using stored memories."""
+    """Generate a response using stored memories and tools."""
     user_id = config["configurable"]["user_id"]
     ns = ("user", user_id, "details")
 
@@ -99,25 +99,13 @@ def chat_node(
         if items else ""
     )
 
-    response = llm.invoke(
+    response = llm_with_tools.invoke(
         [
             SystemMessage(
                 content=SYSTEM_PROMPT_TEMPLATE.format(
                     user_details_content=user_details
                 )
             ),
-        ]
-        + state["messages"]
-    )
-    return {"messages": [response]}
-
-
-# ── Node 3: Refine (add personality + tool calls) ───────────────
-def refine_node(state: MessagesState):
-    """Polish the raw response with humor and personality, handle tool calls."""
-    response = llm_with_tools.invoke(
-        [
-            SystemMessage(content=REFINE_PROMPT),
         ]
         + state["messages"]
     )

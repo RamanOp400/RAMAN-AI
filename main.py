@@ -2,16 +2,36 @@ import os
 import json
 from contextlib import asynccontextmanager
 
-from langgraph.graph import START, StateGraph, MessagesState
+from langgraph.graph import START, END, StateGraph, MessagesState
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.store.postgres import PostgresStore
-from langgraph.checkpoint.postgres import PostgresSaver
-from graph import remember_node, chat_node, refine_node, tools_list
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from graph import remember_node, chat_node
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from langchain_core.messages import HumanMessage, AIMessageChunk
+from tools import (
+    get_current_date_and_time,
+    web_search,
+    calculator,
+    safe_shell_executor,
+    search_wikipedia,
+    search_academic_papers,
+)
 
+# ── Tools ────────────────────────────────────────────────────────
+tools_list = [
+    get_current_date_and_time,
+    web_search,
+    calculator,
+    safe_shell_executor,
+    search_wikipedia,
+    search_academic_papers,
+]
+
+
+tools_list_bc = ToolNode(tools_list)
 
 class ChatRequest(BaseModel):
     message: str = Field(..., description="user message")
@@ -24,14 +44,15 @@ class ChatRequest(BaseModel):
 graph_def = StateGraph(MessagesState)
 graph_def.add_node("remember", remember_node)
 graph_def.add_node("chat", chat_node)
-graph_def.add_node("refine", refine_node)
-graph_def.add_node("tools", ToolNode(tools=tools_list))
+graph_def.add_node("tools", tools_list_bc)
 
 graph_def.add_edge(START, "remember")
 graph_def.add_edge("remember", "chat")
-graph_def.add_edge("chat", "refine")
-graph_def.add_conditional_edges("refine", tools_condition)
-graph_def.add_edge("tools", "refine")
+graph_def.add_conditional_edges("chat", tools_condition)
+graph_def.add_edge("tools", "chat")
+graph_def.add_edge("chat", END)
+
+
 
 # ── Database ─────────────────────────────────────────────────────
 DB_URI = os.getenv(
@@ -40,27 +61,27 @@ DB_URI = os.getenv(
 )
 
 
-# ── FastAPI lifespan (manages DB connections) ────────────────────
+# ── FastAPI  ────────────────────
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Open store & checkpointer on startup, close on shutdown."""
-    with PostgresStore.from_conn_string(DB_URI) as store, \
-         PostgresSaver.from_conn_string(DB_URI) as checkpointer:
+    """Open store (sync) + async checkpointer on startup, close on shutdown."""
+    with PostgresStore.from_conn_string(DB_URI) as store:
         store.setup()
-        checkpointer.setup()
-        app.state.workflow = graph_def.compile(store=store, checkpointer=checkpointer)
-        yield
+        async with AsyncPostgresSaver.from_conn_string(DB_URI) as checkpointer:
+            await checkpointer.setup()
+            app.state.workflow = graph_def.compile(store=store, checkpointer=checkpointer)
+            yield
 
 
 app = FastAPI(title="RAMAN AI", lifespan=lifespan)
 
 
-# ── Regular endpoint (full response) ────────────────────────────
+# ── Regular endpoint  ────────────────────────────
 @app.post("/chat")
-def chat(req: ChatRequest, request: Request):
+async def chat(req: ChatRequest, request: Request):
     workflow = request.app.state.workflow
     config = {"configurable": {"user_id": req.user_id, "thread_id": req.thread_id}}
-    result = workflow.invoke(
+    result = await workflow.ainvoke(
         {"messages": [HumanMessage(content=req.message)]},
         config,
     )
@@ -81,8 +102,8 @@ async def chat_stream(req: ChatRequest, request: Request):
         ):
             kind = event["event"]
 
-            # Stream tokens from the refine node (final response)
-            if kind == "on_chat_model_stream":
+            # Stream tokens from the refine node ONLY
+            if kind == "on_chat_model_stream" and event.get("metadata", {}).get("langgraph_node") == "refine":
                 chunk = event["data"]["chunk"]
                 if isinstance(chunk, AIMessageChunk) and chunk.content:
                     data = json.dumps({"token": chunk.content})
